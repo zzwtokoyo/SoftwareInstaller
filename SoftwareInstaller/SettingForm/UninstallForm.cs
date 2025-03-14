@@ -3,6 +3,7 @@ using SoftwareInstaller.RunTask;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Security.Policy;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -74,10 +75,13 @@ namespace SoftwareInstaller
             installedPrograms = new List<(string Name, string UninstallString, string Version, string Publisher)>();
             string[] registryKeys =
             {
-                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-                @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-            };
+        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+        @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+    };
 
+            // 使用 HashSet 跟踪已添加的程序名称（忽略大小写）
+            HashSet<string> addedProgramNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+            
             try
             {
                 foreach (var key in registryKeys)
@@ -96,11 +100,17 @@ namespace SoftwareInstaller
                                         string uninstallString = subKey.GetValue("UninstallString") as string;
                                         string version = subKey.GetValue("DisplayVersion") as string ?? "未知";
                                         string publisher = subKey.GetValue("Publisher") as string ?? "未知";
+
                                         if (!string.IsNullOrEmpty(displayName) && !string.IsNullOrEmpty(uninstallString) &&
                                             (string.IsNullOrEmpty(filter) || displayName.Contains(filter, StringComparison.OrdinalIgnoreCase)))
                                         {
-                                            installedPrograms.Add((displayName, uninstallString, version, publisher));
-                                            lvPrograms.Items.Add(new ListViewItem(new[] { displayName, version, publisher }));
+                                            // 检查程序名称是否已添加
+                                            if (!addedProgramNames.Contains(displayName))
+                                            {
+                                                installedPrograms.Add((displayName, uninstallString, version, publisher));
+                                                lvPrograms.Items.Add(new ListViewItem(new[] { displayName, version, publisher }));
+                                                addedProgramNames.Add(displayName); // 标记为已添加
+                                            }
                                         }
                                     }
                                 }
