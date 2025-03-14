@@ -1,17 +1,17 @@
-﻿using System;
+﻿using Microsoft.Win32;
+using SoftwareInstaller.RunTask;
+using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Threading.Tasks;
 using System.Windows.Forms;
-using System.IO;
-using Microsoft.Win32;
-using LiteDB;
-using System.Threading.Tasks; // 添加对 LiteDB 的引用，因为使用了 InstallStatus 和 records
 
 namespace SoftwareInstaller
 {
     public partial class UninstallForm : Form
     {
-        private Form1 mainForm;
+        private readonly Form1 mainForm;
+        private readonly LogManager _logManager; // 从主窗体传递 LogManager 实例
         private ListView lvPrograms;
         private TextBox txtSearch;
         private TextBox txtUninstallArgs;
@@ -20,6 +20,7 @@ namespace SoftwareInstaller
         public UninstallForm(Form1 parent)
         {
             mainForm = parent;
+            _logManager = parent._logManager; // 从 Form1 获取 LogManager 实例
             InitializeComponent();
             InitializeControls();
             LoadInstalledPrograms();
@@ -107,10 +108,12 @@ namespace SoftwareInstaller
                         }
                     }
                 }
+                _logManager.Info($"加载已安装程序列表，找到 {installedPrograms.Count} 个程序");
             }
             catch (Exception ex)
             {
                 MessageBox.Show($"加载程序列表失败: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                _logManager.Error($"加载程序列表失败: {ex.Message}");
             }
         }
 
@@ -123,95 +126,92 @@ namespace SoftwareInstaller
             }
 
             TextBox txtOutput = mainForm.Controls["txtOutput"] as TextBox;
-            mainForm.latestLogFile = $"Uninstall_Log_{DateTime.Now:yyyyMMdd_HHmmss}.txt";
-            using (StreamWriter sw = new StreamWriter(mainForm.latestLogFile))
+            foreach (ListViewItem item in lvPrograms.SelectedItems)
             {
-                foreach (ListViewItem item in lvPrograms.SelectedItems)
+                string productName = item.Text;
+                var program = installedPrograms.Find(p => p.Name == productName);
+                string uninstallString = program.UninstallString;
+                string uninstallArgs = txtUninstallArgs.Text;
+
+                txtOutput.AppendText($"开始卸载: {productName}" + Environment.NewLine);
+                _logManager.Info($"开始卸载 {productName}");
+
+                Process process = new Process
                 {
-                    string productName = item.Text;
-                    var program = installedPrograms.Find(p => p.Name == productName);
-                    string uninstallString = program.UninstallString;
-                    string uninstallArgs = txtUninstallArgs.Text;
-
-                    txtOutput.AppendText($"开始卸载: {productName}" + Environment.NewLine);
-                    sw.WriteLine($"{DateTime.Now}: 开始卸载 {productName}");
-
-                    Process process = new Process
+                    StartInfo = new ProcessStartInfo
                     {
-                        StartInfo = new ProcessStartInfo
+                        FileName = "cmd.exe",
+                        Arguments = $"/C {uninstallString} {uninstallArgs}",
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        CreateNoWindow = true
+                    },
+                    EnableRaisingEvents = true
+                };
+
+                mainForm.progressBarUninstall.Value = 0;
+                mainForm.progressBarUninstall.Maximum = 100;
+                int progress = 0;
+
+                process.OutputDataReceived += (s, ev) =>
+                {
+                    if (ev.Data != null)
+                    {
+                        this.Invoke((Action)(() =>
                         {
-                            FileName = "cmd.exe",
-                            Arguments = $"/C {uninstallString} {uninstallArgs}",
-                            UseShellExecute = false,
-                            RedirectStandardOutput = true,
-                            RedirectStandardError = true,
-                            CreateNoWindow = true
-                        },
-                        EnableRaisingEvents = true
-                    };
-
-                    mainForm.progressBarUninstall.Value = 0;
-                    mainForm.progressBarUninstall.Maximum = 100;
-                    int progress = 0;
-
-                    process.OutputDataReceived += (s, ev) =>
-                    {
-                        if (ev.Data != null)
-                        {
-                            this.Invoke((Action)(() =>
-                            {
-                                txtOutput.AppendText(ev.Data + Environment.NewLine);
-                                sw.WriteLine($"{DateTime.Now}: {ev.Data}");
-                                progress = Math.Min(progress + 10, 90);
-                                mainForm.progressBarUninstall.Value = progress;
-                            }));
-                        }
-                    };
-
-                    process.ErrorDataReceived += (s, ev) =>
-                    {
-                        if (ev.Data != null)
-                        {
-                            this.Invoke((Action)(() =>
-                            {
-                                txtOutput.AppendText("错误: " + ev.Data + Environment.NewLine);
-                                sw.WriteLine($"{DateTime.Now}: 错误: {ev.Data}");
-                            }));
-                        }
-                    };
-
-                    process.Exited += (s, ev) =>
-                    {
-                        this.Invoke((Action)(() => mainForm.progressBarUninstall.Value = 100));
-                    };
-
-                    process.Start();
-                    process.BeginOutputReadLine();
-                    process.BeginErrorReadLine();
-
-                    if (await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(60000)) == Task.Delay(60000))
-                    {
-                        process.Kill();
-                        txtOutput.AppendText("卸载超时，已终止！" + Environment.NewLine);
-                        sw.WriteLine($"{DateTime.Now}: 卸载超时，已终止");
+                            txtOutput.AppendText(ev.Data + Environment.NewLine);
+                            _logManager.Output(ev.Data);
+                            progress = Math.Min(progress + 10, 90);
+                            mainForm.progressBarUninstall.Value = progress;
+                        }));
                     }
-                    else if (process.ExitCode == 0)
+                };
+
+                process.ErrorDataReceived += (s, ev) =>
+                {
+                    if (ev.Data != null)
                     {
-                        txtOutput.AppendText("卸载成功！" + Environment.NewLine);
-                        sw.WriteLine($"{DateTime.Now}: 卸载成功");
-                        var record = mainForm.records.FindOne(r => r.FilePath.ToLower().Contains(productName.ToLower()));
-                        if (record != null)
+                        this.Invoke((Action)(() =>
                         {
-                            record.Status = InstallStatus.NotInstalled;
-                            record.Timestamp = DateTime.Now;
-                            mainForm.records.Update(record);
-                        }
+                            txtOutput.AppendText("错误: " + ev.Data + Environment.NewLine);
+                            _logManager.Error(ev.Data);
+                        }));
                     }
-                    else
+                };
+
+                process.Exited += (s, ev) =>
+                {
+                    this.Invoke((Action)(() => mainForm.progressBarUninstall.Value = 100));
+                };
+
+                process.Start();
+                process.BeginOutputReadLine();
+                process.BeginErrorReadLine();
+
+                if (await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(60000)) == Task.Delay(60000))
+                {
+                    process.Kill();
+                    txtOutput.AppendText("卸载超时，已终止！" + Environment.NewLine);
+                    _logManager.Error("卸载超时，已终止");
+                }
+                else if (process.ExitCode == 0)
+                {
+                    txtOutput.AppendText("卸载成功！" + Environment.NewLine);
+                    _logManager.Info("卸载成功");
+                    var record = mainForm.records.FindOne(r => r.FilePath.ToLower().Contains(productName.ToLower()));
+                    if (record != null)
                     {
-                        txtOutput.AppendText($"卸载失败，退出代码: {process.ExitCode}" + Environment.NewLine);
-                        sw.WriteLine($"{DateTime.Now}: 卸载失败，退出代码: {process.ExitCode}");
+                        record.Status = InstallStatus.NotInstalled;
+                        record.Timestamp = DateTime.Now;
+                        mainForm.records.Update(record);
+                        _logManager.Info($"更新记录状态: {record.FilePath} -> NotInstalled");
                     }
+                }
+                else
+                {
+                    txtOutput.AppendText($"卸载失败，退出代码: {process.ExitCode}" + Environment.NewLine);
+                    _logManager.Error($"卸载失败，退出代码: {process.ExitCode}");
                 }
             }
 
