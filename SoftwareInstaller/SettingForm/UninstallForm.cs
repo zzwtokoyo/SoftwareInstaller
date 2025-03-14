@@ -3,7 +3,8 @@ using SoftwareInstaller.RunTask;
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
-using System.Security.Policy;
+using System.Linq;
+using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
 
@@ -11,37 +12,48 @@ namespace SoftwareInstaller
 {
     public partial class UninstallForm : Form
     {
-        private readonly Form1 mainForm;
-        private readonly LogManager _logManager; // 从主窗体传递 LogManager 实例
+        public readonly Form1 mainForm;
+        private readonly LogManager _logManager;
+        private readonly List<(string Name, string UninstallString, string Version, string Publisher)> installedPrograms;
         private ListView lvPrograms;
         private TextBox txtSearch;
         private TextBox txtUninstallArgs;
-        private List<(string Name, string UninstallString, string Version, string Publisher)> installedPrograms;
+        private NumericUpDown nudTimeout;
+        private CancellationTokenSource cts;
+        private Button btnCancelUninstall;
+        private int completedPrograms; // 新增：跟踪已完成程序数，替代 ref 参数
 
         public UninstallForm(Form1 parent)
         {
+            if (parent == null) throw new ArgumentNullException(nameof(parent));
             mainForm = parent;
-            _logManager = parent._logManager; // 从 Form1 获取 LogManager 实例
+            _logManager = parent._logManager ?? throw new ArgumentNullException(nameof(parent._logManager));
+            installedPrograms = new List<(string Name, string UninstallString, string Version, string Publisher)>();
+            completedPrograms = 0; // 初始化
             InitializeComponent();
             InitializeControls();
-            LoadInstalledPrograms();
+            LoadInstalledProgramsAsync().ConfigureAwait(false);
         }
 
         private void InitializeControls()
         {
-            this.Text = "卸载程序";
-            this.Width = 650;
-            this.Height = 450;
-            this.StartPosition = FormStartPosition.CenterParent;
+            if (InvokeRequired)
+            {
+                Invoke(new Action(InitializeControls));
+                return;
+            }
 
-            // 搜索框
-            Label lblSearch = new Label() { Text = "搜索:", Left = 20, Top = 20, Width = 50 };
-            txtSearch = new TextBox() { Left = 70, Top = 20, Width = 200 };
+            Text = "卸载程序";
+            Width = 650;
+            Height = 480;
+            StartPosition = FormStartPosition.CenterParent;
+
+            Label lblSearch = new Label { Text = "搜索:", Left = 20, Top = 20, Width = 50 };
+            txtSearch = new TextBox { Left = 70, Top = 20, Width = 200 };
             txtSearch.TextChanged += TxtSearch_TextChanged;
 
-            // 程序列表
-            Label lblPrograms = new Label() { Text = "已安装程序:", Left = 20, Top = 60, Width = 100 };
-            lvPrograms = new ListView()
+            Label lblPrograms = new Label { Text = "已安装程序:", Left = 20, Top = 60, Width = 100 };
+            lvPrograms = new ListView
             {
                 Left = 20,
                 Top = 90,
@@ -55,75 +67,92 @@ namespace SoftwareInstaller
             lvPrograms.Columns.Add("版本", 100);
             lvPrograms.Columns.Add("发行商", 120);
 
-            // 卸载参数
-            Label lblUninstallArgs = new Label() { Text = "卸载参数:", Left = 20, Top = 350, Width = 80 };
-            txtUninstallArgs = new TextBox() { Left = 100, Top = 350, Width = 260, Text = "/S" };
+            Label lblUninstallArgs = new Label { Text = "卸载参数:", Left = 20, Top = 350, Width = 80 };
+            txtUninstallArgs = new TextBox { Left = 100, Top = 350, Width = 260, Text = "/S" };
 
-            // 按钮
-            Button btnUninstall = new Button() { Text = "卸载选中", Left = 410, Top = 350, Width = 100 };
-            Button btnCancel = new Button() { Text = "取消", Left = 520, Top = 350, Width = 100 };
+            Label lblTimeout = new Label { Text = "超时(秒):", Left = 20, Top = 380, Width = 80 };
+            nudTimeout = new NumericUpDown { Left = 100, Top = 380, Width = 60, Minimum = 10, Maximum = 300, Value = 60 };
+
+            Button btnUninstall = new Button { Text = "卸载选中", Left = 300, Top = 380, Width = 100 };
+            btnCancelUninstall = new Button { Text = "取消卸载", Left = 410, Top = 380, Width = 100, Enabled = false };
+            Button btnCancel = new Button { Text = "关闭", Left = 520, Top = 380, Width = 100 };
 
             btnUninstall.Click += BtnUninstall_Click;
-            btnCancel.Click += (s, e) => this.Close();
+            btnCancelUninstall.Click += BtnCancelUninstall_Click;
+            btnCancel.Click += (s, e) => Close();
 
-            this.Controls.AddRange(new Control[] { lblSearch, txtSearch, lblPrograms, lvPrograms, lblUninstallArgs, txtUninstallArgs, btnUninstall, btnCancel });
+            Controls.AddRange(new Control[] { lblSearch, txtSearch, lblPrograms, lvPrograms, lblUninstallArgs, txtUninstallArgs, lblTimeout, nudTimeout, btnUninstall, btnCancelUninstall, btnCancel });
         }
 
-        private void LoadInstalledPrograms(string filter = "")
+        private async Task LoadInstalledProgramsAsync(string filter = "")
         {
-            lvPrograms.Items.Clear();
-            installedPrograms = new List<(string Name, string UninstallString, string Version, string Publisher)>();
-            string[] registryKeys =
+            if (InvokeRequired)
             {
-        @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
-        @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
-    };
+                await InvokeAsync(async () => await LoadInstalledProgramsAsync(filter));
+                return;
+            }
 
-            // 使用 HashSet 跟踪已添加的程序名称（忽略大小写）
-            HashSet<string> addedProgramNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            
+            lvPrograms.Items.Clear();
+            installedPrograms.Clear();
+            string[] registryKeys = {
+                @"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+                @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"
+            };
+
             try
             {
-                foreach (var key in registryKeys)
+                HashSet<string> addedProgramNames = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                foreach (string key in registryKeys)
                 {
-                    using (RegistryKey rk = Registry.LocalMachine.OpenSubKey(key))
+                    RegistryKey rk = Registry.LocalMachine.OpenSubKey(key);
+                    if (rk == null) continue;
+
+                    try
                     {
-                        if (rk != null)
+                        foreach (string subKeyName in rk.GetSubKeyNames())
                         {
-                            foreach (string subKeyName in rk.GetSubKeyNames())
+                            RegistryKey subKey = null;
+                            try
                             {
-                                using (RegistryKey subKey = rk.OpenSubKey(subKeyName))
+                                subKey = rk.OpenSubKey(subKeyName);
+                                if (subKey == null) continue;
+
+                                string displayName = subKey.GetValue("DisplayName") as string;
+                                string uninstallString = subKey.GetValue("UninstallString") as string;
+                                if (string.IsNullOrEmpty(displayName) || string.IsNullOrEmpty(uninstallString)) continue;
+
+                                if (string.IsNullOrEmpty(filter) || displayName.Contains(filter, StringComparison.OrdinalIgnoreCase))
                                 {
-                                    if (subKey != null)
+                                    if (addedProgramNames.Add(displayName))
                                     {
-                                        string displayName = subKey.GetValue("DisplayName") as string;
-                                        string uninstallString = subKey.GetValue("UninstallString") as string;
                                         string version = subKey.GetValue("DisplayVersion") as string ?? "未知";
                                         string publisher = subKey.GetValue("Publisher") as string ?? "未知";
-
-                                        if (!string.IsNullOrEmpty(displayName) && !string.IsNullOrEmpty(uninstallString) &&
-                                            (string.IsNullOrEmpty(filter) || displayName.Contains(filter, StringComparison.OrdinalIgnoreCase)))
-                                        {
-                                            // 检查程序名称是否已添加
-                                            if (!addedProgramNames.Contains(displayName))
-                                            {
-                                                installedPrograms.Add((displayName, uninstallString, version, publisher));
-                                                lvPrograms.Items.Add(new ListViewItem(new[] { displayName, version, publisher }));
-                                                addedProgramNames.Add(displayName); // 标记为已添加
-                                            }
-                                        }
+                                        installedPrograms.Add((displayName, uninstallString, version, publisher));
+                                        lvPrograms.Items.Add(new ListViewItem(new[] { displayName, version, publisher }));
                                     }
                                 }
                             }
+                            catch (Exception ex)
+                            {
+                                _logManager.Error($"读取注册表项 {subKeyName} 失败: {ex.Message}");
+                            }
+                            finally
+                            {
+                                if (subKey != null) subKey.Close();
+                            }
                         }
+                    }
+                    finally
+                    {
+                        rk.Close();
                     }
                 }
                 _logManager.Info($"加载已安装程序列表，找到 {installedPrograms.Count} 个程序");
             }
             catch (Exception ex)
             {
-                MessageBox.Show($"加载程序列表失败: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 _logManager.Error($"加载程序列表失败: {ex.Message}");
+                MessageBox.Show($"加载程序列表失败: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
             }
         }
 
@@ -135,23 +164,84 @@ namespace SoftwareInstaller
                 return;
             }
 
+            string selectedPrograms = string.Join(", ", lvPrograms.SelectedItems.Cast<ListViewItem>().Select(i => i.Text));
+            if (MessageBox.Show($"确定要卸载以下程序吗？\n{selectedPrograms}", "确认卸载", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes)
+                return;
+
             TextBox txtOutput = mainForm.Controls["txtOutput"] as TextBox;
-            foreach (ListViewItem item in lvPrograms.SelectedItems)
+            if (txtOutput == null)
             {
-                string productName = item.Text;
-                var program = installedPrograms.Find(p => p.Name == productName);
-                string uninstallString = program.UninstallString;
-                string uninstallArgs = txtUninstallArgs.Text;
+                MessageBox.Show("无法找到输出文本框！", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                return;
+            }
 
-                txtOutput.AppendText($"开始卸载: {productName}" + Environment.NewLine);
-                _logManager.Info($"开始卸载 {productName}");
+            try
+            {
+                btnCancelUninstall.Enabled = true;
+                cts = new CancellationTokenSource();
+                completedPrograms = 0; // 重置计数器
+                List<Task> uninstallTasks = new List<Task>();
+                int maxConcurrent = 2;
+                int totalPrograms = lvPrograms.SelectedItems.Count;
 
-                Process process = new Process
+                foreach (ListViewItem item in lvPrograms.SelectedItems)
+                {
+                    if (cts.IsCancellationRequested) break;
+
+                    while (uninstallTasks.Count(t => !t.IsCompleted) >= maxConcurrent)
+                        await Task.WhenAny(uninstallTasks);
+
+                    Task uninstallTask = UninstallProgramAsync(item, txtOutput, totalPrograms);
+                    uninstallTasks.Add(uninstallTask);
+                }
+
+                await Task.WhenAll(uninstallTasks.Where(t => !t.IsCanceled));
+                if (!cts.IsCancellationRequested)
+                {
+                    MessageBox.Show($"卸载任务已完成！日志已保存至: {mainForm.latestLogFile}",
+                        "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                }
+                await LoadInstalledProgramsAsync();
+            }
+            catch (OperationCanceledException)
+            {
+                AppendTextSafe(txtOutput, "卸载操作已被取消");
+                _logManager.Info("卸载操作已被取消");
+            }
+            catch (Exception ex)
+            {
+                _logManager.Error($"卸载过程中发生错误: {ex.Message}");
+                MessageBox.Show($"卸载过程中发生错误: {ex.Message}", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+            finally
+            {
+                btnCancelUninstall.Enabled = false;
+                if (cts != null)
+                {
+                    cts.Dispose();
+                    cts = null;
+                }
+            }
+        }
+
+        private async Task UninstallProgramAsync(ListViewItem item, TextBox txtOutput, int totalPrograms)
+        {
+            string productName = item.Text;
+            var program = installedPrograms.FirstOrDefault(p => p.Name == productName);
+            if (program.Equals(default((string, string, string, string)))) return;
+
+            AppendTextSafe(txtOutput, $"开始卸载: {productName}");
+            _logManager.Info($"开始卸载 {productName}");
+
+            Process process = null;
+            try
+            {
+                process = new Process
                 {
                     StartInfo = new ProcessStartInfo
                     {
                         FileName = "cmd.exe",
-                        Arguments = $"/C {uninstallString} {uninstallArgs}",
+                        Arguments = $"/C {program.UninstallString} {txtUninstallArgs.Text}",
                         UseShellExecute = false,
                         RedirectStandardOutput = true,
                         RedirectStandardError = true,
@@ -160,79 +250,132 @@ namespace SoftwareInstaller
                     EnableRaisingEvents = true
                 };
 
-                mainForm.progressBarUninstall.Value = 0;
-                mainForm.progressBarUninstall.Maximum = 100;
-                int progress = 0;
+                await ExecuteProcessAsync(process, txtOutput, productName, totalPrograms);
+            }
+            catch (Exception ex)
+            {
+                AppendTextSafe(txtOutput, $"卸载 {productName} 失败: {ex.Message}");
+                _logManager.Error($"卸载 {productName} 失败: {ex.Message}");
+            }
+            finally
+            {
+                if (process != null) process.Dispose();
+            }
+        }
 
-                process.OutputDataReceived += (s, ev) =>
-                {
-                    if (ev.Data != null)
-                    {
-                        this.Invoke((Action)(() =>
-                        {
-                            txtOutput.AppendText(ev.Data + Environment.NewLine);
-                            _logManager.Output(ev.Data);
-                            progress = Math.Min(progress + 10, 90);
-                            mainForm.progressBarUninstall.Value = progress;
-                        }));
-                    }
-                };
+        private async Task ExecuteProcessAsync(Process process, TextBox txtOutput, string productName, int totalPrograms)
+        {
+            long totalBytesRead = 0;
+            process.OutputDataReceived += (s, ev) => HandleProcessOutput(txtOutput, ev.Data, ref totalBytesRead);
+            process.ErrorDataReceived += (s, ev) => HandleProcessError(txtOutput, ev.Data);
 
-                process.ErrorDataReceived += (s, ev) =>
-                {
-                    if (ev.Data != null)
-                    {
-                        this.Invoke((Action)(() =>
-                        {
-                            txtOutput.AppendText("错误: " + ev.Data + Environment.NewLine);
-                            _logManager.Error(ev.Data);
-                        }));
-                    }
-                };
+            process.Start();
+            process.BeginOutputReadLine();
+            process.BeginErrorReadLine();
 
-                process.Exited += (s, ev) =>
-                {
-                    this.Invoke((Action)(() => mainForm.progressBarUninstall.Value = 100));
-                };
+            int timeoutSeconds = (int)nudTimeout.Value * 1000;
+            Task timeoutTask = Task.Delay(timeoutSeconds, cts.Token);
+            Task processTask = Task.Factory.StartNew(() => process.WaitForExit(), cts.Token);
 
-                process.Start();
-                process.BeginOutputReadLine();
-                process.BeginErrorReadLine();
-
-                if (await Task.WhenAny(process.WaitForExitAsync(), Task.Delay(60000)) == Task.Delay(60000))
-                {
-                    process.Kill();
-                    txtOutput.AppendText("卸载超时，已终止！" + Environment.NewLine);
-                    _logManager.Error("卸载超时，已终止");
-                }
-                else if (process.ExitCode == 0)
-                {
-                    txtOutput.AppendText("卸载成功！" + Environment.NewLine);
-                    _logManager.Info("卸载成功");
-                    var record = mainForm.records.FindOne(r => r.FilePath.ToLower().Contains(productName.ToLower()));
-                    if (record != null)
-                    {
-                        record.Status = InstallStatus.NotInstalled;
-                        record.Timestamp = DateTime.Now;
-                        mainForm.records.Update(record);
-                        _logManager.Info($"更新记录状态: {record.FilePath} -> NotInstalled");
-                    }
-                }
-                else
-                {
-                    txtOutput.AppendText($"卸载失败，退出代码: {process.ExitCode}" + Environment.NewLine);
-                    _logManager.Error($"卸载失败，退出代码: {process.ExitCode}");
-                }
+            if (await Task.WhenAny(processTask, timeoutTask) == timeoutTask)
+            {
+                process.Kill();
+                throw new TimeoutException("卸载超时，已终止");
             }
 
-            MessageBox.Show("卸载任务已完成！日志已保存至: " + mainForm.latestLogFile,
-                "完成", MessageBoxButtons.OK, MessageBoxIcon.Information);
-            LoadInstalledPrograms();
+            cts.Token.ThrowIfCancellationRequested();
+
+            if (process.ExitCode == 0)
+            {
+                AppendTextSafe(txtOutput, $"卸载 {productName} 成功！");
+                _logManager.Info($"卸载 {productName} 成功");
+                UpdateInstallationRecord(productName);
+                completedPrograms++; // 更新计数器
+                UpdateProgressBar(totalPrograms, completedPrograms);
+            }
+            else
+            {
+                throw new Exception($"卸载 {productName} 失败，退出代码: {process.ExitCode}");
+            }
+        }
+
+        private void HandleProcessOutput(TextBox txtOutput, string data, ref long totalBytesRead)
+        {
+            if (data == null) return;
+            if (InvokeRequired)
+            {
+                Invoke(new Action<TextBox, string, long>((tb, d, bytes) => HandleProcessOutput(tb, d, ref bytes)), txtOutput, data, totalBytesRead);
+                return;
+            }
+            AppendTextSafe(txtOutput, data);
+            _logManager.Output(data);
+            totalBytesRead += data.Length;
+        }
+
+        private void HandleProcessError(TextBox txtOutput, string data)
+        {
+            if (data == null) return;
+            if (InvokeRequired)
+            {
+                Invoke(new Action<TextBox, string>(HandleProcessError), txtOutput, data);
+                return;
+            }
+            AppendTextSafe(txtOutput, $"错误: {data}");
+            _logManager.Error(data);
+        }
+
+        private void UpdateProgressBar(int total, int completed)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<int, int>(UpdateProgressBar), total, completed);
+                return;
+            }
+            mainForm.progressBarUninstall.Maximum = total * 100;
+            mainForm.progressBarUninstall.Value = completed * 100;
+        }
+
+        private void AppendTextSafe(TextBox textBox, string text)
+        {
+            if (textBox.InvokeRequired)
+            {
+                textBox.Invoke(new Action<TextBox, string>((tb, t) => tb.AppendText(t + Environment.NewLine)), textBox, text);
+            }
+            else
+            {
+                textBox.AppendText(text + Environment.NewLine);
+            }
+        }
+
+        private void UpdateInstallationRecord(string productName)
+        {
+            var record = mainForm.Records.FindOne(r => r.FilePath.ToLower().Contains(productName.ToLower()));
+            if (record != null)
+            {
+                record.Status = InstallStatus.NotInstalled;
+                record.Timestamp = DateTime.Now;
+                mainForm.Records.Update(record);
+                _logManager.Info($"更新记录状态: {record.FilePath} -> NotInstalled");
+            }
+        }
+
+        private void BtnCancelUninstall_Click(object sender, EventArgs e)
+        {
+            if (cts != null && !cts.IsCancellationRequested)
+            {
+                cts.Cancel();
+                btnCancelUninstall.Enabled = false;
+            }
         }
 
         private void TxtSearch_TextChanged(object sender, EventArgs e)
         {
-            LoadInstalledPrograms(txtSearch.Text);
+            LoadInstalledProgramsAsync(txtSearch.Text).ConfigureAwait(false);
+        }
+
+        private Task InvokeAsync(Func<Task> action)
+        {
+            return Task.Factory.StartNew(action, CancellationToken.None, TaskCreationOptions.None, TaskScheduler.FromCurrentSynchronizationContext()).Unwrap();
         }
     }
 }

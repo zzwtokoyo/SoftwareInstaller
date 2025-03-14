@@ -32,6 +32,10 @@
             this.AutoScaleMode = System.Windows.Forms.AutoScaleMode.Font;
             this.ClientSize = new System.Drawing.Size(800, 450);
             this.Text = "UninstallForm";
+
+            this.lvPrograms = new System.Windows.Forms.ListView();
+            this.txtSearch = new System.Windows.Forms.TextBox();
+            this.txtUninstallArgs = new System.Windows.Forms.TextBox();
         }
 
         #endregion
